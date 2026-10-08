@@ -4832,6 +4832,239 @@
             );
           }
         );
+
+        // -------------------------------------------------------------------
+        // Persistent-config path (setConfig). The original fix lived inside
+        // _parseConfig, which sanitize() skips once setConfig() has run, so
+        // these cases were unguarded: a hook write to data.allowedAttributes
+        // mutated the shared allowlist for the instance lifetime, across calls
+        // and elements. The guard is now applied on every sanitize() call for
+        // both config paths. (GHSA-cmwh-pvxp-8882)
+        // -------------------------------------------------------------------
+
+        QUnit.test(
+          'setConfig: attribute hook does not poison later calls',
+          (assert) => {
+            purify.setConfig({ ALLOWED_TAGS: ['img'], ALLOWED_ATTR: ['src'] });
+            purify.addHook('uponSanitizeAttribute', (node, data) => {
+              if (
+                node.getAttribute &&
+                node.getAttribute('data-trusted') === '1'
+              ) {
+                data.allowedAttributes['onerror'] = true;
+              }
+            });
+
+            // A trusted element widens onerror for its own call.
+            assert.ok(
+              purify
+                .sanitize('<img data-trusted="1" src="x" onerror="ok()">')
+                .indexOf('onerror') !== -1,
+              'in-call widening works for the trusted element under setConfig'
+            );
+
+            // A later untrusted call must NOT inherit the widened attribute.
+            assert.equal(
+              purify.sanitize('<img src="x" onerror="alert(1)">'),
+              '<img src="x">',
+              'untrusted call after trusted render strips onerror'
+            );
+
+            // Repeated calls must stay clean (no accumulated clone state).
+            for (let i = 0; i < 5; i++) {
+              assert.equal(
+                purify.sanitize('<img src="x" onerror="alert(' + i + ')">'),
+                '<img src="x">',
+                'repeated untrusted call ' + i + ' stays clean'
+              );
+            }
+          }
+        );
+
+        QUnit.test(
+          'setConfig: element hook does not poison later calls',
+          (assert) => {
+            purify.setConfig({ ALLOWED_TAGS: ['span'], ALLOWED_ATTR: [] });
+            purify.addHook('uponSanitizeElement', (node, data) => {
+              if (
+                node.getAttribute &&
+                node.getAttribute('data-trusted') === '1' &&
+                data.allowedTags
+              ) {
+                data.allowedTags['img'] = true;
+              }
+            });
+
+            purify.sanitize('<span data-trusted="1"><img src="x"></span>');
+
+            assert.equal(
+              purify.sanitize('<img src="x" onerror="alert(1)">'),
+              '',
+              'untrusted <img> not allowed after trusted render under setConfig'
+            );
+          }
+        );
+
+        QUnit.test(
+          'setConfig: clearConfig restores a clean state',
+          (assert) => {
+            purify.setConfig({ ALLOWED_TAGS: ['img'], ALLOWED_ATTR: ['src'] });
+            purify.addHook('uponSanitizeAttribute', (node, data) => {
+              if (
+                node.getAttribute &&
+                node.getAttribute('data-trusted') === '1'
+              ) {
+                data.allowedAttributes['onerror'] = true;
+              }
+            });
+            purify.sanitize('<img data-trusted="1" src="x" onerror="ok()">');
+
+            purify.clearConfig();
+
+            assert.equal(
+              purify.sanitize('<img src="x" onerror="alert(1)">'),
+              '<img src="x">',
+              'default-cfg call after clearConfig strips onerror'
+            );
+          }
+        );
+
+        QUnit.test(
+          'setConfig: widening does not survive removeAllHooks',
+          (assert) => {
+            purify.setConfig({ ALLOWED_TAGS: ['img'], ALLOWED_ATTR: ['src'] });
+            purify.addHook('uponSanitizeAttribute', (node, data) => {
+              if (
+                node.getAttribute &&
+                node.getAttribute('data-trusted') === '1'
+              ) {
+                data.allowedAttributes['onerror'] = true;
+              }
+            });
+            purify.sanitize('<img data-trusted="1" src="x" onerror="ok()">');
+
+            // With no hook left, nothing is cloned for this call: the
+            // persistent allowlist itself must still be the pristine one.
+            purify.removeAllHooks();
+
+            assert.equal(
+              purify.sanitize('<img src="x" onerror="alert(1)">'),
+              '<img src="x">',
+              'untrusted call after removeAllHooks strips onerror'
+            );
+          }
+        );
+
+        QUnit.test(
+          'setConfig: re-applying the hook-supplied config does not capture a widened allowlist',
+          (assert) => {
+            var hookConfig = null;
+            purify.setConfig({ ALLOWED_TAGS: ['img'], ALLOWED_ATTR: ['src'] });
+            purify.addHook('uponSanitizeAttribute', (node, data, config) => {
+              hookConfig = config;
+              if (
+                node.getAttribute &&
+                node.getAttribute('data-trusted') === '1'
+              ) {
+                data.allowedAttributes['onerror'] = true;
+              }
+            });
+            purify.sanitize('<img data-trusted="1" src="x" onerror="ok()">');
+
+            // The config handed to hooks is the live CONFIG object, so
+            // setConfig() takes _parseConfig's same-config short-circuit.
+            // The bindings it captures must be the pristine sets, not the
+            // clone the trusted render just widened.
+            assert.ok(hookConfig, 'hook received the active config');
+            purify.setConfig(hookConfig);
+
+            assert.equal(
+              purify.sanitize('<img src="x" onerror="alert(1)">'),
+              '<img src="x">',
+              'untrusted call after setConfig(hookConfig) strips onerror'
+            );
+          }
+        );
+
+        QUnit.test(
+          'per-call config: passing the hook-supplied config back does not reuse a widened allowlist',
+          (assert) => {
+            var hookConfig = null;
+            purify.addHook('uponSanitizeAttribute', (node, data, config) => {
+              hookConfig = config;
+              if (
+                node.getAttribute &&
+                node.getAttribute('data-trusted') === '1'
+              ) {
+                data.allowedAttributes['onerror'] = true;
+              }
+            });
+
+            assert.ok(
+              purify
+                .sanitize('<img data-trusted="1" src="x" onerror="ok()">', {
+                  ALLOWED_TAGS: ['img'],
+                  ALLOWED_ATTR: ['src'],
+                })
+                .indexOf('onerror') !== -1,
+              'in-call widening works for the trusted element'
+            );
+
+            // Same CONFIG object again: _parseConfig short-circuits, but the
+            // allowlists must still be rebound to the pristine sets.
+            assert.ok(hookConfig, 'hook received the active config');
+            assert.equal(
+              purify.sanitize('<img src="x" onerror="alert(1)">', hookConfig),
+              '<img src="x">',
+              'untrusted call reusing the hook config strips onerror'
+            );
+          }
+        );
+
+        QUnit.test(
+          'addHook / removeHook / removeHooks ignore non-hook entry points',
+          (assert) => {
+            var noop = function () {};
+            var ownKey = function (key) {
+              return Object.prototype.hasOwnProperty.call(
+                Object.prototype,
+                key
+              );
+            };
+            try {
+              // '__proto__' is not an own key of the hooks map, so a lookup
+              // would resolve to Object.prototype and arrayPush / arrayPop
+              // would write index and length properties onto it.
+              purify.addHook('__proto__', noop);
+              assert.notOk(
+                ownKey('0') || ownKey('length'),
+                'addHook("__proto__") does not write to Object.prototype'
+              );
+
+              purify.removeHook('__proto__', noop);
+              purify.removeHook('__proto__');
+              assert.notOk(
+                ownKey('0') || ownKey('length'),
+                'removeHook("__proto__") does not write to Object.prototype'
+              );
+
+              purify.removeHooks('__proto__');
+              assert.notOk(
+                ownKey('0') || ownKey('length'),
+                'removeHooks("__proto__") does not write to Object.prototype'
+              );
+
+              assert.equal(
+                purify.sanitize('<img src="x" onerror="alert(1)">'),
+                '<img src="x">',
+                'instance still sanitizes after bogus entry points'
+              );
+            } finally {
+              delete Object.prototype[0];
+              delete Object.prototype.length;
+            }
+          }
+        );
       }
     );
     // ---------------------------------------------------------------------------
